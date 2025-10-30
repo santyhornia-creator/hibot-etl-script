@@ -3,3 +3,4 @@ psycopg2-binary
 requests
 pytz
 numpy
+apscheduler
