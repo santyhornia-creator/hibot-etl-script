@@ -20,7 +20,7 @@ except ImportError:
 # --- CONFIGURACIÓN HIBOT ---
 HIBOT_APP_ID = "6749f162ea4755c8d8df65f8"
 HIBOT_APP_SECRET = "260903b7-bdbb-44d7-acaf-bad9decea3a8"
-BASE_URL = "https://pdn.api.hibot.us/api_external"
+BASE_URL = "https.api.hibot.us/api_external"
 
 # --- CONFIGURACIÓN GOOGLE & ARCHIVOS ---
 ARGENTINA_TZ = pytz.timezone('America/Argentina/Buenos_Aires')
