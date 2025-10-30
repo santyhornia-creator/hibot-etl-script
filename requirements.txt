@@ -1,5 +1,5 @@
 requests
 pandas
 pytz
-numpy
 psycopg2-binary
+numpy
