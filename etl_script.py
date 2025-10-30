@@ -136,6 +136,11 @@ def upsert_conversations(conn, df):
     date_columns = ['created', 'closed', 'delegated', 'assigned', 'attentionHour']
     for col in date_columns:
         if col in df_renamed.columns:
+            # --- ¡LA CORRECCIÓN ESTÁ AQUÍ! ---
+            # 1. Forzamos todo a número primero. Los valores malos (ej: "") se vuelven NaN.
+            df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
+            
+            # 2. Ahora, to_datetime solo recibe números válidos o NaN, evitando el overflow.
             df_renamed[col] = pd.to_datetime(df_renamed[col], unit='ms', errors='coerce')
             df_renamed[col] = df_renamed[col].dt.tz_localize('UTC').dt.tz_convert(ARGENTINA_TZ)
         else:
@@ -205,7 +210,7 @@ def upsert_conversations(conn, df):
         print(f"❌ Error durante el 'UPSERT' a la base de datos: {e}")
         conn.rollback()
 
-# --- EJECUCIÓN PRINCIPAL ---
+# --- EJECUCUIÓN PRINCIPAL ---
 def main():
     print(f"[{datetime.now(ARGENTINA_TZ).strftime('%Y-%m-%d %H:%M:%S')}] Iniciando Sincronizador de HiBot...")
     
