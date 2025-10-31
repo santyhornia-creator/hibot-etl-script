@@ -8,35 +8,36 @@ from psycopg2 import extras
 import sys
 import subprocess
 import numpy as np
-import time as time_sleep
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, jsonify
+from flask_cors import CORS
+import atexit
 
-# Importar el programador de tareas
-try:
-    import pytz
-    from apscheduler.schedulers.blocking import BlockingScheduler
-except ImportError:
-    print("Instalando librerías 'pytz' y 'apscheduler'...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pytz", "apscheduler"])
-    import pytz
-    from apscheduler.schedulers.blocking import BlockingScheduler
+# --- INICIALIZAR LA APP WEB ---
+# Esto es necesario para que Render lo reconozca como "Web Service"
+app = Flask(__name__)
+CORS(app) # Para permitir que el dashboard se conecte
 
-# --- CONFIGURACIÓN HIBOT ---
+@app.route('/')
+def health_check():
+    """Ruta simple para que Render sepa que el servicio está vivo."""
+    return jsonify({"status": "ETL Worker está vivo y ejecutándose."}), 200
+
+# --- CONFIGURACIÓN ---
 HIBOT_APP_ID = os.environ.get('HIBOT_APP_ID')
 HIBOT_APP_SECRET = os.environ.get('HIBOT_APP_SECRET')
 BASE_URL = "https://api.hibot.us/api_external"
+ARGENTINA_TZ = pytz.timezone('America/Argentina/Buenos_Aires')
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# --- CONFIGURACIÓN DE LA BASE DE DATOS ---
-ARGENTINA_TZ_STR = 'America/Argentina/Buenos_Aires'
-ARGENTINA_TZ = pytz.timezone(ARGENTINA_TZ_STR)
-DATABASE_URL = os.environ.get('DATABASE_URL') 
-
-# --- FUNCIONES DE HIBOT ---
+# --- FUNCIONES DE HIBOT (Iguales al script anterior) ---
 def get_hibot_token():
     login_url = f"{BASE_URL}/login"
     payload = {"appId": HIBOT_APP_ID, "appSecret": HIBOT_APP_SECRET}
     print("🤖 Obteniendo token de HiBot...")
     try:
-        response = requests.post(login_url, json=payload, timeout=10) # Añadido timeout
+        response = requests.post(login_url, json=payload)
         response.raise_for_status()
         print("✅ Token de HiBot obtenido.")
         return response.json().get('token')
@@ -58,20 +59,16 @@ def get_hibot_conversations(token, start_date, end_date):
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     print(f"📥 Descargando conversaciones de HiBot para el {start_date.strftime('%Y-%m-%d')}...")
     try:
-        response = requests.post(conversations_url, headers=headers, json=payload, timeout=30) # Añadido timeout
+        response = requests.post(conversations_url, headers=headers, json=payload)
         response.raise_for_status()
         conversations = response.json()
         print(f"✅ Se encontraron {len(conversations)} conversaciones.")
         return conversations
     except requests.exceptions.RequestException as e:
         print(f"⚠️ Error al descargar conversaciones para el {start_date.strftime('%Y-%m-%d')}: {e}")
-        try:
-            print(f"   Detalle del servidor: {response.text}")
-        except:
-            pass
         return []
 
-# --- FUNCIONES DE BASE DE DATOS ---
+# --- FUNCIONES DE BASE DE DATOS (Iguales al script anterior) ---
 def get_db_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -123,8 +120,11 @@ def upsert_conversations(conn, df):
     print("🧹 Procesando y limpiando datos...")
     df_normalized = pd.json_normalize(df, sep='.')
     df_renamed = df_normalized.rename(columns={
-        'id': 'hibot_id', 'agent.name': 'agent_name', 'channel.type': 'channel_type',
-        'campaign.name': 'campaign_name', 'status.name': 'status_obj',
+        'id': 'hibot_id',
+        'agent.name': 'agent_name',
+        'channel.type': 'channel_type',
+        'campaign.name': 'campaign_name',
+        'status.name': 'status_obj',
     })
     
     date_columns = ['created', 'closed', 'delegated', 'assigned', 'attentionHour']
@@ -132,7 +132,7 @@ def upsert_conversations(conn, df):
         if col in df_renamed.columns:
             df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
             df_renamed[col] = pd.to_datetime(df_renamed[col], unit='ms', errors='coerce')
-            df_renamed[col] = df_renamed[col].dt.tz_localize('UTC').dt.tz_convert(ARGENTINA_TZ_STR)
+            df_renamed[col] = df_renamed[col].dt.tz_localize('UTC').dt.tz_convert(ARGENTINA_TZ)
         else:
             df_renamed[col] = pd.NaT
             
@@ -161,14 +161,25 @@ def upsert_conversations(conn, df):
     INSERT INTO conversations ({', '.join(column_order)})
     VALUES %s
     ON CONFLICT (hibot_id) DO UPDATE SET
-        created = EXCLUDED.created, closed = EXCLUDED.closed, delegated = EXCLUDED.delegated,
-        assigned = EXCLUDED.assigned, attentionHour = EXCLUDED.attentionHour, duration = EXCLUDED.duration,
-        waitTime = EXCLUDED.waitTime, answerTime = EXCLUDED.answerTime, typing = EXCLUDED.typing,
-        note = EXCLUDED.note, status = EXCLUDED.status, agent_name = EXCLUDED.agent_name,
-        channel_type = EXCLUDED.channel_type, campaign_name = EXCLUDED.campaign_name,
-        dinamico = EXCLUDED.dinamico, numeroov = EXCLUDED.numeroov,
+        created = EXCLUDED.created,
+        closed = EXCLUDED.closed,
+        delegated = EXCLUDED.delegated,
+        assigned = EXCLUDED.assigned,
+        attentionHour = EXCLUDED.attentionHour,
+        duration = EXCLUDED.duration,
+        waitTime = EXCLUDED.waitTime,
+        answerTime = EXCLUDED.answerTime,
+        typing = EXCLUDED.typing,
+        note = EXCLUDED.note,
+        status = EXCLUDED.status,
+        agent_name = EXCLUDED.agent_name,
+        channel_type = EXCLUDED.channel_type,
+        campaign_name = EXCLUDED.campaign_name,
+        dinamico = EXCLUDED.dinamico,
+        numeroov = EXCLUDED.numeroov,
         last_updated = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC');
     """
+    
     try:
         with conn.cursor() as cur:
             extras.execute_values(cur, insert_query, data_tuples)
@@ -179,27 +190,11 @@ def upsert_conversations(conn, df):
         conn.rollback()
 
 # --- FUNCIÓN PRINCIPAL DE SINCRONIZACIÓN ---
-def job_sincronizacion():
-    """
-    Esta es la función que será llamada por el programador (apscheduler).
-    """
-    print(f"--- INICIANDO EJECUCIÓN PROGRAMADA: {datetime.now(ARGENTINA_TZ)} ---")
+def sync_hibot_data():
+    """La lógica principal de ETL que se ejecutará en un horario."""
+    print("==========================================================")
+    print(f"[{datetime.now(ARGENTINA_TZ).strftime('%Y-%m-%d %H:%M:%S')}] Iniciando Sincronizador de HiBot...")
     
-    # 1. Verificar si estamos en horario laboral
-    now = datetime.now(ARGENTINA_TZ)
-    current_time = now.time()
-    current_day = now.weekday() # Lunes=0, Domingo=6
-
-    is_weekday = 0 <= current_day <= 4 and time(9, 0) <= current_time <= time(18, 0)
-    is_saturday = current_day == 5 and time(9, 0) <= current_time <= time(13, 0)
-    
-    if not (is_weekday or is_saturday):
-        print("... Fuera de horario laboral. Omitiendo ejecución.")
-        return
-
-    print("... Dentro del horario laboral. Procediendo con la sincronización.")
-    
-    # 2. Ejecutar el proceso
     conn = get_db_connection()
     if not conn:
         return
@@ -208,6 +203,7 @@ def job_sincronizacion():
     
     hibot_token = get_hibot_token()
     if not hibot_token:
+        print("No se pudo obtener el token, saltando esta ejecución.")
         conn.close()
         return
         
@@ -231,37 +227,36 @@ def job_sincronizacion():
 
     conn.close()
     print("🔌 Conexión a la base de datos cerrada.")
-    print(f"--- EJECUCIÓN PROGRAMADA FINALIZADA: {datetime.now(ARGENTINA_TZ)} ---")
+    print("==========================================================")
 
+# --- PROGRAMADOR DE TAREAS (APScheduler) ---
+# Definimos el horario de Argentina
+cron_schedule_weekday = {
+    'day_of_week': 'mon-fri',
+    'hour': '12-21', # 9:00 a 18:00 ART (en UTC)
+    'minute': '*/15' # Cada 15 minutos
+}
+cron_schedule_saturday = {
+    'day_of_week': 'sat',
+    'hour': '12-16', # 9:00 a 13:00 ART (en UTC)
+    'minute': '*/15' # Cada 15 minutos
+}
 
-# --- EJECUCIÓN DEL "CAMILLERO" (WORKER) ---
+# Inicializamos el programador
+scheduler = BackgroundScheduler(daemon=True, timezone=pytz.utc)
+scheduler.add_job(sync_hibot_data, 'cron', **cron_schedule_weekday)
+scheduler.add_job(sync_hibot_data, 'cron', **cron_schedule_saturday)
+atexit.register(lambda: scheduler.shutdown()) # Asegura que el scheduler se apague bien
+
+# --- INICIO DEL SERVICIO ---
 if __name__ == "__main__":
-    
-    # Verificamos que las variables de entorno cruciales estén presentes
-    if not all([DATABASE_URL, HIBOT_APP_ID, HIBOT_APP_SECRET]):
-        print("❌ FALTAN VARIABLES DE ENTORNO. (DATABASE_URL, HIBOT_APP_ID, HIBOT_APP_SECRET)")
-        print("   Por favor, configúralas en la pestaña 'Environment' de Render.")
-        sys.exit(1) # Detiene el script si faltan variables
+    print("Iniciando el 'Background Worker'...")
+    # Ejecuta la sincronización UNA VEZ al arrancar (para no esperar 15 min)
+    sync_hibot_data() 
+    # Inicia el programador
+    scheduler.start()
+    print(f"Programador de tareas iniciado. Próxima ejecución según horario: {scheduler.get_jobs()[0].next_run_time}")
+    # Inicia el servidor web (necesario para el "Web Service" de Render)
+    # Gunicorn ejecutará 'app'
+    # app.run(host='0.0.0.0', port=os.environ.get('PORT', 10000))
 
-    print("Iniciando el 'Background Worker' (Camillero)...")
-    
-    # 1. Ejecutar el job una vez al arrancar (para no esperar 15 min)
-    try:
-        print("Ejecutando la primera sincronización al arrancar...")
-        job_sincronizacion()
-    except Exception as e:
-        print(f"Error durante la ejecución inicial: {e}")
-
-    # 2. Configurar el programador (scheduler)
-    scheduler = BlockingScheduler(timezone=ARGENTINA_TZ_STR)
-    
-    # Programar la tarea para que se ejecute cada 15 minutos
-    scheduler.add_job(job_sincronizacion, 'interval', minutes=15)
-    
-    print(f"Tarea programada. Próxima ejecución en 15 minutos.")
-    print("El 'Camillero' está despierto y escuchando. (Presiona Ctrl+C para detener localmente)")
-    
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        pass
